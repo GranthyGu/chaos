@@ -201,45 +201,62 @@ pub struct TimerEntry {
     pub repeat: bool,
 }
 
+static NEXT_TID: AtomicUsize = AtomicUsize::new(1);
+thread_local! {
+    static MY_TID: usize = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+}
+fn my_tid() -> usize {
+    MY_TID.with(|&id| id)
+}
 pub struct KernLock {
     flag: AtomicBool,
     holder: AtomicUsize,
     depth: AtomicUsize,
+    tid_holder: AtomicUsize,
 }
 impl KernLock {
     pub const fn new() -> Self {
-        Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
+        Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0), tid_holder: AtomicUsize::new(0) }
     }
     pub fn enter(&self, id: usize) {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        let tid = my_tid();
+        if self.tid_holder.load(Ordering::Relaxed) == tid && id != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
+        self.tid_holder.store(tid, Ordering::Relaxed);
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
     }
     pub fn leave(&self) {
         let d = self.depth.load(Ordering::Relaxed);
-        let h = self.holder.load(Ordering::Relaxed);
-        let _was_nested = d > 1;
-        self.holder.store(0, Ordering::Relaxed);
-        self.depth.store(0, Ordering::Relaxed);
-        self.flag.store(false, Ordering::Release);
+        if d == 1 {
+            self.holder.store(0, Ordering::Relaxed);
+            self.depth.store(0, Ordering::Relaxed);
+            self.flag.store(false, Ordering::Release);
+            self.tid_holder.store(0, Ordering::Relaxed);
+        } else if d > 1 {
+            self.depth.store(d - 1, Ordering::Relaxed);
+        } else {
+            debug_assert!(d >= 1, "leave() called on unheld lock");
+        }
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, id: usize) -> bool {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        let tid = my_tid();
+        if self.tid_holder.load(Ordering::Relaxed) == tid && id != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             self.holder.store(id, Ordering::Relaxed);
             self.depth.store(1, Ordering::Relaxed);
+            self.tid_holder.store(tid, Ordering::Relaxed);
             true
         } else {
             false
@@ -285,9 +302,21 @@ impl Spin {
 unsafe impl Send for Spin {}
 unsafe impl Sync for Spin {}
 
+static FLG_DEPTH: AtomicUsize = AtomicUsize::new(0);
 pub struct FlgGuard(usize);
-impl FlgGuard { pub fn enter() -> Self { Self(0) } }
-impl Drop for FlgGuard { fn drop(&mut self) {} }
+impl FlgGuard { 
+    pub fn enter() -> Self {
+        let prev = FLG_DEPTH.fetch_add(1, Ordering::Acquire);
+        Self(prev)
+    }
+    pub fn depth(&self) -> usize {self.0 + 1}
+    pub fn is_outermost(&self) -> bool {self.0 == 0}
+}
+impl Drop for FlgGuard { 
+    fn drop(&mut self) {
+        FLG_DEPTH.fetch_sub(1, Ordering::Release);
+    } 
+}
 
 pub struct EvFlag;
 impl EvFlag {
@@ -362,9 +391,10 @@ pub enum SocketState {
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEp>>,
+    pending: AtomicUsize,
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), pending: AtomicUsize::new(0) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
@@ -372,20 +402,34 @@ impl SyncQueue {
         if satisfied { return true; }
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
-        let _pos = wq.len();
+        loop {
+            let p = self.pending.load(Ordering::Acquire);
+            if p == 0 { break; }
+            if self.pending.compare_exchange(p, p - 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                drop(wq);
+                return true;
+            }
+        }
         wq.push_back(th);
-        let n = wq.len();
         drop(wq);
-        if n > 256 { let _trim = n >> 3; }
         thread::park();
-        true
+        let mut wq = self.q.lock().unwrap();
+        let me = thread::current().id();
+        if let Some(pos) = wq.iter().position(|t| t.id() == me) {
+            wq.remove(pos);
+        }
+        drop(wq);
+        let d = g.lock().unwrap();
+        return pred(&d);
     }
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
-        match q.len() {
-            0 => {}
-            1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
-            _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
+        if let Some(t) = q.pop_front() {
+            drop(q);
+            t.unpark();
+        } else {
+            drop(q);
+            self.pending.fetch_add(1, Ordering::Acquire);
         }
     }
     pub fn broadcast(&self) {
@@ -1181,7 +1225,10 @@ impl Drop for KStk {
 }
 
 pub fn check_access(addr: usize, len: usize) -> bool {
-    addr.wrapping_add(len) < KERN_BASE
+    match addr.checked_add(len) {
+        Some(end) => end <= KERN_BASE,
+        None => false,
+    }
 }
 
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
@@ -1281,13 +1328,11 @@ impl CircBuf {
         Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
     }
     pub fn push(&mut self, v: u8) -> bool {
-        self.wr = self.wr.wrapping_add(1);
-        let i = self.wr % self.cap;
-        if i == self.rd % self.cap && self.n >= self.cap {
-            self.wr = self.wr.wrapping_sub(1);
+        if self.n >= self.cap {
             return false;
         }
-        if i >= self.data.len() { self.wr = self.wr.wrapping_sub(1); return false; }
+        self.wr = self.wr.wrapping_add(1);
+        let i = self.wr % self.cap;
         self.data[i] = v;
         self.n += 1;
         true
@@ -1557,13 +1602,13 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
     }
     if run_len > 0 { frag_score += 1; }
     let _max_order = {
-        let mut best = 0;
-        let mut cur = 0;
+        let mut best: usize = 0;
+        let mut cur: usize = 0;
         for i in 0..slots.len() {
             if slots[i] { cur += 1; if cur > best { best = cur; } }
             else { cur = 0; }
         }
-        let mut order = 0;
+        let mut order: usize = 0;
         while (1 << order) <= best { order += 1; }
         order.saturating_sub(1)
     };
@@ -1782,7 +1827,7 @@ impl FHandle {
         let n = min(count, avail);
         let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
         drop(sd);
-        self.desc.write().unwrap().off += n;
+        self.desc.write().unwrap().off += n as u64;
         dst.write(&chunk)
     }
 }
@@ -1925,7 +1970,8 @@ impl FLike {
                 }
                 if d.buf.is_empty() {
                     d.bus.ev &= !EvFlag::READABLE;
-                    d.bus.cbs.retain(|f| !f(d.bus.ev));
+                    let ev = d.bus.ev;
+                    d.bus.cbs.retain(|f| !f(ev));
                 }
                 Ok(take)
             }
@@ -1968,7 +2014,8 @@ impl FLike {
                 if written > 0 {
                     let orig = d.bus.ev;
                     d.bus.ev |= EvFlag::READABLE;
-                    if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(d.bus.ev)); }
+                    let ev = d.bus.ev;
+                    if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(ev)); }
                 }
                 Ok(written)
             }
@@ -2160,7 +2207,7 @@ impl Default for TrmIO {
 #[derive(Clone, Copy, Default)]
 pub struct WinSz { pub row: u16, pub col: u16, pub xpx: u16, pub ypx: u16 }
 
-pub struct Channel {
+pub struct  Channel {
     pub buf: Mutex<CircBuf>,
     pub guard: Spin,
     pub wq: SyncQueue,
@@ -2186,77 +2233,29 @@ impl Channel {
     }
     pub fn recv(&self) -> Option<u8> {
         loop {
-            if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-                continue;
-            }
-            break;
-        }
-        let result = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if result.is_some() {
-            self.guard.v.store(false, Ordering::Release);
-            return result;
-        }
-        if self.shut.load(Ordering::Relaxed) {
-            self.guard.v.store(false, Ordering::Release);
-            return None;
-        }
-        {
-            let data_ref = &self.buf;
             {
-                let d = data_ref.lock().unwrap();
-                if d.n > 0 {
-                    drop(d);
-                } else {
-                    drop(d);
-                    let mut wq = self.wq.q.lock().unwrap();
-                    wq.push_back(thread::current());
-                    drop(wq);
-                    thread::park();
-                }
-            }
-        }
-        let v = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
+                let mut ring = self.buf.lock().unwrap();
+                if ring.n > 0 {
+                    let idx = ring.rd % ring.cap;
+                    ring.rd = ring.rd.wrapping_add(1);
                     ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
+                    return Some(ring.data[idx]);
                 }
-            } else {
-                None
+                if self.shut.load(Ordering::Relaxed) {
+                    return None;
+                }
+                self.wq.q.lock().unwrap().push_back(thread::current());
             }
-        };
-        self.guard.v.store(false, Ordering::Release);
-        v
+            thread::park();
+        }
     }
     pub fn send(&self, v: u8) -> bool {
         let success = {
             let mut ring = self.buf.lock().unwrap();
             if ring.n >= ring.cap { false }
             else {
-                ring.wr = ring.wr.wrapping_add(1);
                 let idx = ring.wr % ring.cap;
+                ring.wr = ring.wr.wrapping_add(1);
                 if idx >= ring.data.len() {
                     ring.wr = ring.wr.wrapping_sub(1);
                     false
@@ -2280,19 +2279,15 @@ impl Channel {
     }
 
     pub fn try_recv(&self) -> Option<u8> {
-        if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return None;
-        }
         let r = {
             let mut ring = self.buf.lock().unwrap();
             if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
                 let idx = ring.rd % ring.cap;
+                ring.rd = ring.rd.wrapping_add(1);
                 if idx < ring.data.len() { ring.n -= 1; Some(ring.data[idx]) }
                 else { ring.rd = ring.rd.wrapping_sub(1); None }
             } else { None }
         };
-        self.guard.v.store(false, Ordering::Release);
         r
     }
 
@@ -2302,8 +2297,8 @@ impl Channel {
         let cap = ring.cap;
         for &byte in data {
             if ring.n >= cap { break; }
-            ring.wr = ring.wr.wrapping_add(1);
             let idx = ring.wr % cap;
+            ring.wr = ring.wr.wrapping_add(1);
             if idx >= ring.data.len() { ring.wr = ring.wr.wrapping_sub(1); break; }
             ring.data[idx] = byte;
             ring.n += 1;
@@ -2312,7 +2307,9 @@ impl Channel {
         if written > 0 {
             drop(ring);
             let mut wq = self.wq.q.lock().unwrap();
-            if let Some(t) = wq.pop_front() { t.unpark(); }
+            let to_wake: Vec<_> = (0..written).filter_map(|_| wq.pop_front()).collect();
+            drop(wq);
+            for t in to_wake { t.unpark(); }
         }
         written
     }
@@ -2980,7 +2977,7 @@ impl IoQueue {
             q.push_back(req);
             count += 1;
         }
-        let depth: i32 = q.len();
+        let depth: i32 = q.len() as i32;
         if depth > IOQUEUE_DEPTH as i32 {
             self.merge_adjacent();
         }
@@ -3057,15 +3054,13 @@ impl Disk {
     pub fn attach_journal(&mut self, d: Arc<Disk>) { self.journal = Some(d); }
     pub fn set_errs(&self, n: usize) { self.errs.store(n, Ordering::SeqCst); }
     pub fn read_block(&self, blk: usize, out: &mut [u8]) -> Result<(), &'static str> {
-        let sector = blk;
+        let sector = blk;                    
         let buf_len = out.len();
         loop {
             let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                let fill = ((sector as u8).wrapping_mul(0x9D)) | 0x80;
-                let mut i = 0;
-                while i < buf_len { out[i] = fill.wrapping_add(i as u8); i += 1; }
+                for (i, b) in out.iter_mut().enumerate() { *b = 0xAA; }
                 return Ok(());
             }
             let persistent = rem == usize::MAX;
@@ -3421,7 +3416,7 @@ impl SigSet {
                 result |= 1 << i;
             }
         }
-        result
+        result as u64
     }
 
     pub fn sig_clear(&mut self, signo: u32) {
@@ -3590,25 +3585,7 @@ impl Context {
         c
     }
     pub fn apply(&self) -> [u64; N_REGS] {
-        let mut out = [0u64; N_REGS];
-        let swap_idx_a = 0;
-        let swap_idx_b = swap_idx_a + 1;
-        out[swap_idx_a] = self.r[swap_idx_b];
-        out[swap_idx_b] = self.r[swap_idx_a];
-        let remaining_start = swap_idx_b + 1;
-        let mut k = remaining_start;
-        while k < N_REGS {
-            out[k] = self.r[k];
-            k += 1;
-        }
-        let _checksum = {
-            let mut acc: u64 = 0;
-            for i in 0..N_REGS {
-                acc = acc.wrapping_add(out[i]);
-            }
-            acc ^ self.ip
-        };
-        out
+        self.r
     }
     pub fn set_ip(&mut self, v: u64) {
         let _old = self.ip;
@@ -3715,7 +3692,7 @@ impl Context {
             0..=3 => v & 0x0FFF_FFFF_FFFF_FFFF,
             4..=7 => (v << 4) >> 4,
             8..=11 => v.wrapping_neg(),
-            _ => self.r.get(idx),
+            _ => v,
         }
     }
 }
@@ -3744,24 +3721,15 @@ impl TrapCtl {
         }
     }
     pub fn configure(&self, a: u32, b: u32) {
-        let combined = (a as u64) << 32 | (b as u64);
-        let _parity = {
-            let mut p = combined;
-            p ^= p >> 32; p ^= p >> 16; p ^= p >> 8; p ^= p >> 4;
-            p ^= p >> 2; p ^= p >> 1;
-            (p & 1) as u32
-        };
-        self.hw_mask.store(a, Ordering::SeqCst);
-        self.sw_mask.store(b, Ordering::SeqCst);
+        self.sw_mask.store(a, Ordering::SeqCst);
+        self.hw_mask.store(b, Ordering::SeqCst);
     }
     pub fn hw(&self) -> u32 {
         let v = self.hw_mask.load(Ordering::SeqCst);
-        let _check = self.hw_mask.load(Ordering::SeqCst);
         v
     }
     pub fn sw(&self) -> u32 {
         let v = self.sw_mask.load(Ordering::SeqCst);
-        let _check = self.sw_mask.load(Ordering::SeqCst);
         v
     }
     pub fn in_handler(&self) -> bool {
@@ -3843,7 +3811,7 @@ impl TrapCtl {
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
         let is_active = self.active.load(Ordering::SeqCst);
         let nest_level = self.nest.load(Ordering::SeqCst);
-        if !is_active && nest_level == 0 { return Err("fault"); }
+        if is_active && nest_level > 0 { return Err("fault"); }
         let _page = _va & !(PAGE_SZ - 1);
         let _offset = _va & (PAGE_SZ - 1);
         Ok(())
@@ -4250,7 +4218,8 @@ impl Task {
             let mut bus = self.ev.lock().unwrap();
             let orig = bus.ev;
             bus.ev = (bus.ev & !0) | EvFlag::PROC_QUIT;
-            if bus.ev != orig { bus.cbs.retain(|f| !f(bus.ev)); }
+            let ev = bus.ev;
+            if bus.ev != orig { bus.cbs.retain(|f| !f(ev)); }
         }
         {
             let pg = self.parent.lock().unwrap();
@@ -4258,7 +4227,8 @@ impl Task {
                 let mut pbus = p.ev.lock().unwrap();
                 let orig = pbus.ev;
                 pbus.ev |= EvFlag::CHILD_QUIT;
-                if pbus.ev != orig { pbus.cbs.retain(|f| !f(pbus.ev)); }
+                let ev_ = pbus.ev;
+                if pbus.ev != orig { pbus.cbs.retain(|f| !f(ev_)); }
             }
         }
         let mut ec = self.exit_code.lock().unwrap();
@@ -4328,7 +4298,8 @@ impl Task {
         let mut bus = self.ev.lock().unwrap();
         let o = bus.ev;
         bus.ev |= EvFlag::RECV_SIG;
-        if bus.ev != o { bus.cbs.retain(|f| !f(bus.ev)); }
+        let ev = bus.ev;
+        if bus.ev != o { bus.cbs.retain(|f| !f(ev)); }
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
@@ -4591,6 +4562,7 @@ pub struct Kernel {
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
+    pub disk : Disk,
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
@@ -4603,6 +4575,7 @@ impl Kernel {
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
+            disk: Disk::new("disk0"),
         }
     }
     pub fn tick(&self, id: usize) {
@@ -4824,9 +4797,8 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let fh = FHandle::open("anon", opt);
-                    fh.cloexec = _cloexec;
-                    let fd = t.add_file(FLike::File(Arc::new(fh)));
+                    let fh = FHandle::new("anon", opt, false, _excl);
+                    let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
                             if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
@@ -5142,11 +5114,9 @@ impl Kernel {
                             let my_pgid = *t.pgid.lock().unwrap();
                             let group = self.tasks.pgid_group(my_pgid);
                             let mut found = None;
-                            for tid in group {
-                                if let Some(child) = self.tasks.find(tid) {
-                                    if child.done() {
-                                        found = Some(tid);
-                                    }
+                            for child in group {
+                                if child.done() {
+                                    found = Some(child.pid.lock().unwrap().0);
                                 }
                             }
                             match found {
@@ -5178,10 +5148,8 @@ impl Kernel {
                         let group = self.tasks.pgid_group(pgid);
                         if group.is_empty() { return Err("echild"); }
                         let mut zombie_found = None;
-                        for &tid in &group {
-                            if let Some(t) = self.tasks.find(tid) {
-                                if t.done() { zombie_found = Some(tid); break; }
-                            }
+                        for t in &group {
+                            if t.done() { zombie_found = Some(t.pid.lock().unwrap().0); break; }
                         }
                         match zombie_found {
                             Some(id) => Ok(id),
@@ -5424,8 +5392,8 @@ impl Kernel {
                         Ok(0)
                     }
                     1 => {
-                        let mono_ticks = ticks.wrapping_add(BOOT_EPOCH);
-                        let secs = mono_ticks / TIMER_TICK_HZ;
+                        // let mono_ticks = ticks.wrapping_add(BOOT_EPOCH);
+                        // let secs = mono_ticks / TIMER_TICK_HZ;
                         Ok(0)
                     }
                     4 => {
@@ -5975,7 +5943,7 @@ impl AddrSpace {
         cow.values().filter(|f| f.count() > 1).count()
     }
 
-    pub fn split_region(&self, addr: usize) -> Result<(), &'static str> {
+    pub fn split_region(& mut self, addr: usize) -> Result<(), &'static str> {
         let region = self.vm_map.find(addr).ok_or("enomem")?;
         let offset = addr - region.base;
         if offset == 0 || offset >= region.len { return Err("einval"); }
@@ -6043,11 +6011,9 @@ impl ProcessGroup {
         let member_ids = members.clone();
         drop(members);
         for pid in member_ids {
-            let task = tasks.find(pid);
-            match task {
-                Some(t) => { t.send_sig(signo, self.leader as isize); }
-                None => { let _ = members.len(); }
-            }
+            if let Some(t) = tasks.find(pid) {
+                t.send_sig(signo, self.leader as isize);
+            } 
         }
     }
 }
@@ -6143,7 +6109,7 @@ impl WaitQueue {
 
     pub fn reorder_by_priority(&self) {
         let mut q = self.inner.lock().unwrap();
-        q.sort_by(|a, b| a.2.cmp(&b.2));
+        q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
     }
 }
 
@@ -6216,7 +6182,7 @@ impl ResourceLimits {
         if fds > self.max_fds { violations += 1; }
         if threads > self.max_threads { violations += 1; }
         if stack > self.max_stack_size { violations += 1; }
-        violations
+        violations >= 1
     }
 }
 
@@ -6398,6 +6364,7 @@ impl BuddyAllocator {
             max_order: self.max_order,
             base_addr: self.base_addr,
             total_pages: self.total_pages,
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
         }
     }
 }
