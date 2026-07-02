@@ -79,14 +79,10 @@ impl Kernel {
             let total = MAX_CPU;
             if total > 0 { ((total - busy) * 100) / total } else { 100 }
         };
-        {
-            for ci in 0..self.cache.chains.len() {
-                let ch = &self.cache.chains[ci];
-                while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
-                { let mut items = ch.items.lock().unwrap(); for s in items.iter_mut() { s.modified = false; } }
-                ch.lk.v.store(false, Ordering::Release);
-            }
-        }
+        // 之前这里遍历所有 cache chain 把 modified 无条件清零 —
+        // 这会丢失"这些缓存槽还没刷回磁盘"的关键信息，等同于欺骗后续
+        // 回收逻辑说"没有脏页"。tick 只应统计/推进时钟，脏标志必须
+        // 保留到真正 flush 之后才能清。
         GKL.holder.store(0, Ordering::Relaxed);
         GKL.depth.store(0, Ordering::Relaxed);
         GKL.flag.store(false, Ordering::Release);
@@ -123,9 +119,9 @@ impl Kernel {
         }
     }
     pub fn handle_pgfault_ext(&self, addr: usize, _access: u8) -> bool {
-        let pga = addr >> 12;
-        let _off = addr & 0xFFF;
-        if _access & 0x2 != 0 { return self.handle_pgfault(addr); }
+        // 之前这里有一个"if 写访问 return handle_pgfault(addr); else handle_pgfault(addr)"
+        // 的重复分支 —两个分支调用同一个函数，语义上没有任何区别。
+        // chaos 里 handle_pgfault 本身也不区分读写，所以这里直接透传。
         self.handle_pgfault(addr)
     }
     pub fn proc_init(&self) {
@@ -346,7 +342,7 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let fh = FHandle::new("anon", opt, false, _excl);
+                    let fh = FHandle::new("anon", opt, false, _cloexec);
                     let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
@@ -666,6 +662,7 @@ impl Kernel {
                             for child in group {
                                 if child.done() {
                                     found = Some(child.pid.lock().unwrap().0);
+                                    break;
                                 }
                             }
                             match found {
