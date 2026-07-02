@@ -42,8 +42,6 @@ pub struct Kernel {
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
     pub disk : Disk,
-    /// Concurrent audit log.  Off by default; tests turn it on via
-    /// `kernel.audit.enable()`.  See `fs/audit.rs`.
     pub audit: AuditLog,
 }
 impl Kernel {
@@ -58,7 +56,7 @@ impl Kernel {
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
             disk: Disk::new("disk0"),
-            audit: AuditLog::new(65536),           // 64K records cap
+            audit: AuditLog::new(65536),
         }
     }
     pub fn tick(&self, id: usize) {
@@ -158,33 +156,13 @@ impl Kernel {
         })
     }
 
-    /// Audit-instrumented entry point for every syscall.
-    ///
-    /// Wraps `dispatch_syscall_inner` (the original 800-line dispatcher)
-    /// with the concurrent audit log. When `self.audit.enable()` has
-    /// been called, every fs-touching syscall (read/write/open/close/
-    /// stat/fstat/mmap/munmap/pipe/dup/dup2/fcntl) produces one
-    /// `AuditRecord` covering the call site's pid, timestamp, fd/path
-    /// argument, byte count, and success/errno outcome.
-    ///
-    /// When audit is disabled (the default) `begin()` returns `None`
-    /// and every hook collapses to a single relaxed atomic load —
-    /// zero allocation, no locking, no measurable overhead. The
-    /// original dispatcher's semantics and return value are preserved
-    /// bit-for-bit; audit only observes, it never changes what the
-    /// syscall does.
     pub fn dispatch_syscall(
         &self,
         nr: usize,
         a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize,
     ) -> Result<usize, &'static str> {
-        // Capture pid at entry. If no task is on CPU 0 yet (e.g. before
-        // proc_init), record pid=0 so tests can tell that case apart.
         let pid = self.cur_task(0).map(|t| t.id()).unwrap_or(0);
 
-        // Classify: which of the fs-touching syscalls is this, and
-        // which argument is fd / which is a path?  Anything not in
-        // this table stays outside audit.
         let audit_info = match nr {
             SYS_READ  => Some((AuditOp::Read,   Some(a0), None)),
             SYS_WRITE => Some((AuditOp::Write,  Some(a0), None)),
@@ -201,17 +179,10 @@ impl Kernel {
             _ => None,
         };
 
-        // begin() is `None` either when audit is off (global switch) or
-        // when this syscall is not on the fs-touching list. Either
-        // way, end() below is a no-op for such calls.
         let draft = audit_info.and_then(|(op, fd, path)| self.audit.begin(op, pid, fd, path));
 
-        // Run the actual, unchanged, 800-line dispatcher.
         let result = self.dispatch_syscall_inner(nr, a0, a1, a2, a3, a4, a5);
 
-        // Commit the audit record with the outcome.  `bytes` mirrors
-        // the syscall return value on success (byte count for r/w,
-        // fd for open, address for mmap, etc.).
         let bytes = result.as_ref().ok().copied();
         match &result {
             Ok(_)  => self.audit.end(draft, AuditResult::Success,     bytes),
@@ -221,9 +192,6 @@ impl Kernel {
         result
     }
 
-    /// Original monolithic dispatcher — unchanged.  All existing
-    /// callers reach this through `dispatch_syscall`, which layers the
-    /// audit hooks on top.
     pub fn dispatch_syscall_inner(&self, nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<usize, &'static str> {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
